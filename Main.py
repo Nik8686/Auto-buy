@@ -1,26 +1,22 @@
 # ============================================================
 # PUMP.FUN ULTIMATE HUNTER + AUTO BUY / AUTO SELL
 # (Top 10 Filter + Buyback Surge + Creator Rewards Badge)
-# Google Colab - Multi-Public Free Nodes + Telegram Alerts
+# Railway / Server Edition - Multi-Public Free Nodes + Telegram Alerts
 # Auto Trade: PumpPortal Local API (signing happens locally)
 # ============================================================
-
 
 import asyncio
 import json
 import aiohttp
 import websockets
-import nest_asyncio
+import os
 import base64
 import hashlib
 import struct
 import time
-from google.colab import userdata
 
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
-
-nest_asyncio.apply()
 
 # ============================================================
 # CONFIG & MULTI-PUBLIC NODES
@@ -43,28 +39,13 @@ PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUMPPORTAL_TRADE_LOCAL = "https://pumpportal.fun/api/trade-local"
 
 # ============================================================
-# COLAB SECRETS (TELEGRAM + WALLET)
+# ENVIRONMENT VARIABLES (TELEGRAM + WALLET)
 # ============================================================
 
-try:
-    TELEGRAM_BOT_TOKEN = userdata.get("TELEGRAM_BOT_TOKEN")
-except Exception:
-    TELEGRAM_BOT_TOKEN = None
-
-try:
-    TELEGRAM_CHAT_ID = userdata.get("TELEGRAM_CHAT_ID")
-except Exception:
-    TELEGRAM_CHAT_ID = None
-
-try:
-    TRADING_WALLET_PRIVATE_KEY = userdata.get("TRADING_WALLET_PRIVATE_KEY")
-except Exception:
-    TRADING_WALLET_PRIVATE_KEY = None
-
-try:
-    HELIUS_API_KEY = userdata.get("HELIUS_API_KEY")
-except Exception:
-    HELIUS_API_KEY = None
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TRADING_WALLET_PRIVATE_KEY = os.getenv("TRADING_WALLET_PRIVATE_KEY")
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 
 print("Telegram Bot Token:", "OK ✅" if TELEGRAM_BOT_TOKEN else "MISSING ❌")
 print("Telegram Chat ID:", "OK ✅" if TELEGRAM_CHAT_ID else "MISSING ❌")
@@ -413,7 +394,6 @@ async def execute_sell(mint, reason, current_mcap):
             for attempt in range(1, SELL_RETRIES + 1):
                 try:
                     tx = await build_signed_tx("sell", mint, "100%", False)
-                    # preflight شغال: إلا كانت المعاملة غادي تفشل ما كتتبعثش وما كتخلصش رسوم
                     sig, ok = await send_and_confirm(tx, skip_preflight=False)
                     if ok:
                         break
@@ -440,7 +420,6 @@ async def execute_sell(mint, reason, current_mcap):
         )
         await send_telegram_with_button(msg, mint)
     else:
-        # فشل البيع: تبريد 20 ثانية بين المحاولات، وأقصى 3 محاولات إجمالا
         pos["fails"] = pos.get("fails", 0) + 1
         pos["next_try"] = time.time() + 20
         pos["selling"] = False
@@ -469,7 +448,7 @@ def check_position(mint, current_mcap):
         asyncio.create_task(execute_sell(mint, reason, current_mcap))
 
 async def fetch_dex_price(mint):
-    """سعر العملة بالـ SOL من DexScreener (كيخدم حتى بعد الـ migration لـ PumpSwap)."""
+    """سعر العملة بالـ SOL من DexScreener."""
     url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
     try:
         async with aiohttp.ClientSession() as session:
@@ -488,8 +467,6 @@ async def fetch_dex_price(mint):
         return None
 
 async def position_watchdog():
-    """شبكة أمان: إلا ما جاتش تريدات من الـ WebSocket لعملة مشتراة (مثلا migration
-    لـ PumpSwap أو انقطاع)، كيجيب السعر من DexScreener كل 5 ثواني ويطبق TP/SL."""
     while True:
         await asyncio.sleep(5)
         for mint, pos in list(positions.items()):
@@ -504,7 +481,7 @@ async def position_watchdog():
                 continue
             ratio = price / pos["entry_price"]
             if ratio < 0.001 or ratio > 50:
-                continue  # قيمة غير منطقية، نتجاهلها
+                continue
             check_position(mint, pos["entry_mcap"] * ratio)
 
 # ============================================================
@@ -551,7 +528,6 @@ async def process_trade(event, signature):
     wallet = event["user"]
     is_buy = event["is_buy"]
 
-    # مراقبة TP/SL على كل تريد للعملة المشتراة (قبل فلتر الحد الأدنى)
     if mint in positions:
         positions[mint]["last_event"] = time.time()
         check_position(mint, calculate_mcap(event))
@@ -648,7 +624,6 @@ async def process_trade(event, signature):
             print(f"\n🎯 [SIGNAL FOUND] Mint: {mint} | Top 10 Share: {top_10_share_pct:.1f}% | Buyback Surge: {is_buyback_surge}\n")
             asyncio.create_task(send_telegram_with_button(message, mint))
 
-            # ===== AUTO BUY =====
             if AUTO_TRADE_ENABLED:
                 asyncio.create_task(execute_buy(mint, current_mcap, event_price(event)))
 
@@ -716,7 +691,7 @@ async def listen_solana():
             await asyncio.sleep(reconnect_delay)
 
 # ============================================================
-# START
+# START (Railway Standard Entry)
 # ============================================================
 
 async def main():
@@ -725,4 +700,5 @@ async def main():
     print("=" * 60)
     await asyncio.gather(listen_solana(), cleanup_loop(), position_watchdog())
 
-await main()
+if __name__ == "__main__":
+    asyncio.run(main())
