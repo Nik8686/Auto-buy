@@ -1,22 +1,33 @@
 # ============================================================
 # PUMP.FUN ULTIMATE HUNTER + AUTO BUY / AUTO SELL
 # (Top 10 Filter + Buyback Surge + Creator Rewards Badge)
-# Railway / Server Edition - Multi-Public Free Nodes + Telegram Alerts
+# Google Colab - Multi-Public Free Nodes + Telegram Alerts
 # Auto Trade: PumpPortal Local API (signing happens locally)
 # ============================================================
+
 
 import asyncio
 import json
 import aiohttp
 import websockets
-import os
 import base64
 import hashlib
 import struct
 import time
+import os
+
+class userdata:
+    """بديل لـ Colab userdata: كيقرا من متغيرات البيئة ديال Railway."""
+    @staticmethod
+    def get(name):
+        v = os.environ.get(name)
+        if v is None:
+            raise KeyError(name)
+        return v
 
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
+
 
 # ============================================================
 # CONFIG & MULTI-PUBLIC NODES
@@ -39,13 +50,28 @@ PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUMPPORTAL_TRADE_LOCAL = "https://pumpportal.fun/api/trade-local"
 
 # ============================================================
-# ENVIRONMENT VARIABLES (TELEGRAM + WALLET)
+# COLAB SECRETS (TELEGRAM + WALLET)
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TRADING_WALLET_PRIVATE_KEY = os.getenv("TRADING_WALLET_PRIVATE_KEY")
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
+try:
+    TELEGRAM_BOT_TOKEN = userdata.get("TELEGRAM_BOT_TOKEN")
+except Exception:
+    TELEGRAM_BOT_TOKEN = None
+
+try:
+    TELEGRAM_CHAT_ID = userdata.get("TELEGRAM_CHAT_ID")
+except Exception:
+    TELEGRAM_CHAT_ID = None
+
+try:
+    TRADING_WALLET_PRIVATE_KEY = userdata.get("TRADING_WALLET_PRIVATE_KEY")
+except Exception:
+    TRADING_WALLET_PRIVATE_KEY = None
+
+try:
+    HELIUS_API_KEY = userdata.get("HELIUS_API_KEY")
+except Exception:
+    HELIUS_API_KEY = None
 
 print("Telegram Bot Token:", "OK ✅" if TELEGRAM_BOT_TOKEN else "MISSING ❌")
 print("Telegram Chat ID:", "OK ✅" if TELEGRAM_CHAT_ID else "MISSING ❌")
@@ -115,15 +141,21 @@ MAX_PROCESSED_SIGNATURES = 100_000
 AUTO_TRADE_ENABLED = True       # False = تنبيهات فقط بلا شراء
 DRY_RUN = False                 # True = كيحاكي الشراء/البيع بلا ما يرسل معاملات حقيقية
 BUY_AMOUNT_SOL = 0.007          # مبلغ الصفقة
-TAKE_PROFIT_PCT = 50.0          # +50%
+TAKE_PROFIT_PCT = 100.0          # +100%
 STOP_LOSS_PCT = 50.0            # -50%
 SLIPPAGE_PCT = 25               # slippage مسموح (%)
 PRIORITY_FEE_SOL = 0.0005       # رسوم الأولوية
 MAX_OPEN_POSITIONS = 3          # حماية: أقصى عدد صفقات مفتوحة فنفس الوقت
 CONFIRM_TIMEOUT_SECONDS = 40
-SELL_RETRIES = 4
+
+# إعدادات البيع (أسرع وأقوى من الشراء، لأن الخروج هو لي كيحمي الربح)
+SELL_SLIPPAGE_PCT = 20          # slippage أكبر للبيع باش ما يفشلش ملي السعر كيتحرك بسرعة
+SELL_PRIORITY_FEE_SOL = 0.0005   # رسوم أولوية أعلى للبيع باش يوصل بسرعة
+SELL_CONFIRM_SECONDS = 4        # إلا ما تأكدتش المعاملة فهاد المدة، كنبنيو وحدة جديدة
+SELL_RETRIES = 3
 
 positions = {}   # mint -> {entry_mcap, status, selling, ...}
+STATS = {"ws": None, "last_msg": time.time(), "msgs": 0, "events": 0, "alerts": 0}
 
 # ============================================================
 # BASE58 & DISCRIMINATOR
@@ -243,7 +275,7 @@ async def send_telegram_with_button(message, mint):
 # AUTO TRADE ENGINE
 # ============================================================
 
-async def build_signed_tx(action, mint, amount, denominated_in_sol):
+async def build_signed_tx(action, mint, amount, denominated_in_sol, slippage=None, priority_fee=None):
     """كيطلب المعاملة من PumpPortal وكيوقعها محليا بالمفتاح ديالك."""
     payload = {
         "publicKey": str(TRADING_KEYPAIR.pubkey()),
@@ -251,8 +283,8 @@ async def build_signed_tx(action, mint, amount, denominated_in_sol):
         "mint": mint,
         "amount": amount,
         "denominatedInSol": "true" if denominated_in_sol else "false",
-        "slippage": SLIPPAGE_PCT,
-        "priorityFee": PRIORITY_FEE_SOL,
+        "slippage": slippage if slippage is not None else SLIPPAGE_PCT,
+        "priorityFee": priority_fee if priority_fee is not None else PRIORITY_FEE_SOL,
         "pool": "auto",
     }
     async with aiohttp.ClientSession() as session:
@@ -296,13 +328,13 @@ async def get_token_balance(mint):
     except Exception:
         return None
 
-async def send_and_confirm(tx_b64, skip_preflight=True):
+async def send_and_confirm(tx_b64, skip_preflight=True, timeout=None):
     sig = await rpc_call("sendTransaction", [tx_b64, {
         "encoding": "base64", "skipPreflight": skip_preflight, "maxRetries": 5
     }])
-    deadline = time.time() + CONFIRM_TIMEOUT_SECONDS
+    deadline = time.time() + (timeout if timeout is not None else CONFIRM_TIMEOUT_SECONDS)
     while time.time() < deadline:
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
         try:
             res = await rpc_call("getSignatureStatuses", [[sig], {"searchTransactionHistory": True}])
             st = (res or {}).get("value", [None])[0]
@@ -377,15 +409,6 @@ async def execute_sell(mint, reason, current_mcap):
     if not pos:
         return
 
-    # إلا الرصيد 0 (بعتيها يدويا) نسد الصفقة بلا ما نبعث حتى معاملة
-    if not DRY_RUN and TRADING_KEYPAIR:
-        bal = await get_token_balance(mint)
-        if bal is not None and bal == 0:
-            positions.pop(mint, None)
-            await send_telegram_with_button(
-                f"ℹ️ <b>POSITION CLOSED (no balance)</b>\n<code>{mint}</code>\nالرصيد 0 (غالبا بعتيها يدويا). وقفت المراقبة.", mint)
-            return
-
     sig, ok = None, False
     try:
         if DRY_RUN:
@@ -393,18 +416,32 @@ async def execute_sell(mint, reason, current_mcap):
         else:
             for attempt in range(1, SELL_RETRIES + 1):
                 try:
-                    tx = await build_signed_tx("sell", mint, "100%", False)
-                    sig, ok = await send_and_confirm(tx, skip_preflight=False)
+                    # كل محاولة = معاملة جديدة (blockhash جديد) بدل الانتظار الطويل
+                    tx = await build_signed_tx("sell", mint, "100%", False,
+                                               slippage=SELL_SLIPPAGE_PCT,
+                                               priority_fee=SELL_PRIORITY_FEE_SOL)
+                    # preflight شغال: إلا كانت المعاملة غادي تفشل ما كتتبعثش وما كتخلصش رسوم
+                    sig, ok = await send_and_confirm(tx, skip_preflight=False,
+                                                     timeout=SELL_CONFIRM_SECONDS)
                     if ok:
                         break
                 except Exception as e:
-                    print(f"⚠️ Sell attempt {attempt} failed: {e}")
-                await asyncio.sleep(1)
+                    print(f"⚠️ Sell attempt {attempt} failed: {scrub(e)}")
+                # بعد كل فشل: واش الرصيد وصل 0؟ (المعاملة وصلات متأخرة أو بعتيها يدويا)
+                bal = await get_token_balance(mint)
+                if bal is not None and bal == 0:
+                    ok = True
+                    break
+                await asyncio.sleep(0.3)
     except Exception as e:
-        print(f"❌ Sell error: {e}")
+        print(f"❌ Sell error: {scrub(e)}")
 
+    sig = sig or "unknown"
     entry = pos["entry_mcap"]
     pnl_pct = ((current_mcap - entry) / entry * 100.0) if entry > 0 else 0.0
+    last_mcap = pos.get("last_mcap", current_mcap)
+    last_pct = ((last_mcap - entry) / entry * 100.0) if entry > 0 else 0.0
+    delay_s = time.time() - pos.get("trigger_time", time.time())
 
     if ok:
         positions.pop(mint, None)
@@ -414,12 +451,15 @@ async def execute_sell(mint, reason, current_mcap):
             f"{icon} <b>{tag}AUTO SELL - {reason}</b>\n\n"
             f"🪙 <code>{mint}</code>\n"
             f"📈 Entry MCAP: {entry:.2f} SOL\n"
-            f"📉 Exit MCAP: {current_mcap:.2f} SOL\n"
-            f"💹 Approx PnL: <b>{pnl_pct:+.1f}%</b>\n"
+            f"🎯 Trigger MCAP: {current_mcap:.2f} SOL (<b>{pnl_pct:+.1f}%</b> وقت الإشارة)\n"
+            f"📉 Last seen MCAP: {last_mcap:.2f} SOL (<b>{last_pct:+.1f}%</b> فاخر سعر شفناه)\n"
+            f"⏱ Sell took: {delay_s:.0f}s\n"
+            f"ℹ️ الربح الحقيقي كاين فالمعاملة (Tx)، هادو غير تقدير\n"
             f"🔗 <a href=\"https://solscan.io/tx/{sig}\">Tx</a>"
         )
         await send_telegram_with_button(msg, mint)
     else:
+        # فشل البيع: تبريد 20 ثانية بين المحاولات، وأقصى 3 محاولات إجمالا
         pos["fails"] = pos.get("fails", 0) + 1
         pos["next_try"] = time.time() + 20
         pos["selling"] = False
@@ -445,10 +485,11 @@ def check_position(mint, current_mcap):
         reason = "STOP LOSS"
     if reason:
         pos["selling"] = True
+        pos["trigger_time"] = time.time()
         asyncio.create_task(execute_sell(mint, reason, current_mcap))
 
 async def fetch_dex_price(mint):
-    """سعر العملة بالـ SOL من DexScreener."""
+    """سعر العملة بالـ SOL من DexScreener (كيخدم حتى بعد الـ migration لـ PumpSwap)."""
     url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
     try:
         async with aiohttp.ClientSession() as session:
@@ -467,12 +508,15 @@ async def fetch_dex_price(mint):
         return None
 
 async def position_watchdog():
+    """شبكة أمان: إلا ما جاتش تريدات من الـ WebSocket لعملة مشتراة (مثلا migration
+    لـ PumpSwap أو انقطاع)، كيجيب السعر من DexScreener كل 5 ثواني ويطبق TP/SL."""
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(2)
         for mint, pos in list(positions.items()):
             if pos["status"] != "open" or pos["selling"]:
                 continue
-            if time.time() - pos["last_event"] < 10:
+            # بعد الـ migration ما كاين حتى event من الـ WebSocket، فنسولو DexScreener مباشرة
+            if not pos.get("migrated") and time.time() - pos["last_event"] < 4:
                 continue
             if pos.get("entry_price", 0) <= 0:
                 continue
@@ -481,8 +525,26 @@ async def position_watchdog():
                 continue
             ratio = price / pos["entry_price"]
             if ratio < 0.001 or ratio > 50:
-                continue
-            check_position(mint, pos["entry_mcap"] * ratio)
+                continue  # قيمة غير منطقية، نتجاهلها
+            pos["last_mcap"] = pos["entry_mcap"] * ratio
+            check_position(mint, pos["last_mcap"])
+
+async def heartbeat_loop():
+    """كيطبع حالة البوت كل دقيقتين، وكيعاود الاتصال إلا الـ WebSocket سكت (ما جاو حتى رسائل)."""
+    while True:
+        await asyncio.sleep(120)
+        idle = time.time() - STATS["last_msg"]
+        peak_ok = sum(1 for t in tokens.values() if t["peak_mcap_sol"] >= MIN_PEAK_MCAP_SOL)
+        dips = sum(1 for t in tokens.values() if t["in_dip"])
+        print(f"💓 msgs={STATS['msgs']} events={STATS['events']} idle={idle:.0f}s | "
+              f"tokens={len(tokens)} peak>={MIN_PEAK_MCAP_SOL:.0f}SOL={peak_ok} in_dip={dips} "
+              f"alerts={STATS['alerts']} positions={len(positions)}")
+        if idle > 45 and STATS["ws"] is not None:
+            print("⚠️ WebSocket silent for >45s, forcing reconnect...")
+            try:
+                await STATS["ws"].close()
+            except Exception:
+                pass
 
 # ============================================================
 # TOKEN STATE & STRATEGY LOGIC
@@ -528,9 +590,16 @@ async def process_trade(event, signature):
     wallet = event["user"]
     is_buy = event["is_buy"]
 
+    # مراقبة TP/SL على كل تريد للعملة المشتراة (قبل فلتر الحد الأدنى)
+    STATS["events"] += 1
     if mint in positions:
         positions[mint]["last_event"] = time.time()
-        check_position(mint, calculate_mcap(event))
+        _m = calculate_mcap(event)
+        if _m > 0:
+            positions[mint]["last_mcap"] = _m
+        if event["real_token_reserves"] == 0:
+            positions[mint]["migrated"] = True   # الـ bonding curve كملات، العملة غادي لـ PumpSwap
+        check_position(mint, _m)
 
     if sol_amount < MIN_TRANSACTION_SOL:
         return
@@ -602,6 +671,7 @@ async def process_trade(event, signature):
 
         if not token["alert_sent"]:
             token["alert_sent"] = True
+            STATS["alerts"] += 1
             peak_usd = token["peak_mcap_sol"] * SOL_PRICE_USD if SOL_PRICE_USD > 0 else 0.0
             current_mcap_usd = current_mcap * SOL_PRICE_USD if SOL_PRICE_USD > 0 else 0.0
 
@@ -624,6 +694,7 @@ async def process_trade(event, signature):
             print(f"\n🎯 [SIGNAL FOUND] Mint: {mint} | Top 10 Share: {top_10_share_pct:.1f}% | Buyback Surge: {is_buyback_surge}\n")
             asyncio.create_task(send_telegram_with_button(message, mint))
 
+            # ===== AUTO BUY =====
             if AUTO_TRADE_ENABLED:
                 asyncio.create_task(execute_buy(mint, current_mcap, event_price(event)))
 
@@ -656,6 +727,8 @@ async def listen_solana():
                 }
                 await ws.send(json.dumps(subscription))
                 await ws.recv()
+                STATS["ws"] = ws
+                STATS["last_msg"] = time.time()
                 print(f"✅ Connected! Hunter + Auto Trade Active "
                       f"(enabled={AUTO_TRADE_ENABLED}, dry_run={DRY_RUN})...")
 
@@ -663,6 +736,8 @@ async def listen_solana():
                     message = json.loads(raw_message)
                     if message.get("method") != "logsNotification":
                         continue
+                    STATS["last_msg"] = time.time()
+                    STATS["msgs"] += 1
 
                     value = message.get("params", {}).get("result", {}).get("value", {})
                     signature = value.get("signature")
@@ -691,14 +766,14 @@ async def listen_solana():
             await asyncio.sleep(reconnect_delay)
 
 # ============================================================
-# START (Railway Standard Entry)
+# START
 # ============================================================
 
 async def main():
     print("=" * 60)
     print("PUMP.FUN: HUNTER + AUTO BUY / AUTO SELL")
     print("=" * 60)
-    await asyncio.gather(listen_solana(), cleanup_loop(), position_watchdog())
+    await asyncio.gather(listen_solana(), cleanup_loop(), position_watchdog(), heartbeat_loop())
 
 if __name__ == "__main__":
     asyncio.run(main())
