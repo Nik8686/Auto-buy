@@ -5,7 +5,6 @@
 # Auto Trade: PumpPortal Local API (signing happens locally)
 # ============================================================
 
-!pip -q install aiohttp websockets nest_asyncio solders
 
 import asyncio
 import json
