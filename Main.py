@@ -8,6 +8,8 @@
 
 import asyncio
 import json
+import html
+from urllib.parse import urlparse
 import aiohttp
 import websockets
 import base64
@@ -35,15 +37,13 @@ from solders.transaction import VersionedTransaction
 
 PUBLIC_WSS_NODES = [
     "wss://api.mainnet-beta.solana.com",
-    "wss://rpc.ankr.com/solana/ws",
     "wss://solana-rpc.publicnode.com"
 ]
 
 # HTTP RPC (لإرسال المعاملات) - كيجرب وحدة وحدة
 PUBLIC_HTTP_RPCS = [
     "https://api.mainnet-beta.solana.com",
-    "https://solana-rpc.publicnode.com",
-    "https://rpc.ankr.com/solana"
+    "https://solana-rpc.publicnode.com"
 ]
 
 PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -113,7 +113,7 @@ if TRADING_KEYPAIR:
 # ============================================================
 
 MIN_PEAK_MCAP_SOL = 60.0
-MIN_DIP_DEPTH_PCT = 5.0
+MIN_DIP_DEPTH_PCT = 05.0
 MAX_DIP_DEPTH_PCT = 80.0
 MIN_POST_DIP_BUY_SOL = 10.0
 MIN_CONSOLIDATION_WALLETS = 40
@@ -141,18 +141,20 @@ MAX_PROCESSED_SIGNATURES = 100_000
 AUTO_TRADE_ENABLED = True       # False = تنبيهات فقط بلا شراء
 DRY_RUN = False                 # True = كيحاكي الشراء/البيع بلا ما يرسل معاملات حقيقية
 BUY_AMOUNT_SOL = 0.007          # مبلغ الصفقة
-TAKE_PROFIT_PCT = 100.0          # +100%
+TAKE_PROFIT_PCT = 70.0          # +70%
 STOP_LOSS_PCT = 50.0            # -50%
-SLIPPAGE_PCT = 25               # slippage مسموح (%)
+SLIPPAGE_PCT = 20               # slippage مسموح (%)
 PRIORITY_FEE_SOL = 0.0005       # رسوم الأولوية
 MAX_OPEN_POSITIONS = 3          # حماية: أقصى عدد صفقات مفتوحة فنفس الوقت
 CONFIRM_TIMEOUT_SECONDS = 40
 
 # إعدادات البيع (أسرع وأقوى من الشراء، لأن الخروج هو لي كيحمي الربح)
 SELL_SLIPPAGE_PCT = 20          # slippage أكبر للبيع باش ما يفشلش ملي السعر كيتحرك بسرعة
-SELL_PRIORITY_FEE_SOL = 0.0005   # رسوم أولوية أعلى للبيع باش يوصل بسرعة
-SELL_CONFIRM_SECONDS = 4        # إلا ما تأكدتش المعاملة فهاد المدة، كنبنيو وحدة جديدة
-SELL_RETRIES = 3
+SELL_PRIORITY_FEE_SOL = 0.001   # رسوم أولوية أعلى للبيع باش يوصل بسرعة
+SELL_CONFIRM_SECONDS = 8        # إلا ما تأكدتش المعاملة فهاد المدة، كنبنيو وحدة جديدة
+SELL_RETRIES = 6
+MAX_SELL_ROUNDS = 8             # عدد جولات إعادة البيع قبل ما نوقف ونعلمك
+SELL_ROUND_COOLDOWN_SECONDS = 8 # راحة بين الجولات
 
 positions = {}   # mint -> {entry_mcap, status, selling, ...}
 STATS = {"ws": None, "last_msg": time.time(), "msgs": 0, "events": 0, "alerts": 0}
@@ -275,7 +277,7 @@ async def send_telegram_with_button(message, mint):
 # AUTO TRADE ENGINE
 # ============================================================
 
-async def build_signed_tx(action, mint, amount, denominated_in_sol, slippage=None, priority_fee=None):
+async def build_signed_tx(action, mint, amount, denominated_in_sol, slippage=None, priority_fee=None, pool="auto"):
     """كيطلب المعاملة من PumpPortal وكيوقعها محليا بالمفتاح ديالك."""
     payload = {
         "publicKey": str(TRADING_KEYPAIR.pubkey()),
@@ -285,7 +287,7 @@ async def build_signed_tx(action, mint, amount, denominated_in_sol, slippage=Non
         "denominatedInSol": "true" if denominated_in_sol else "false",
         "slippage": slippage if slippage is not None else SLIPPAGE_PCT,
         "priorityFee": priority_fee if priority_fee is not None else PRIORITY_FEE_SOL,
-        "pool": "auto",
+        "pool": pool,
     }
     async with aiohttp.ClientSession() as session:
         async with session.post(PUMPPORTAL_TRADE_LOCAL, data=payload, timeout=20) as resp:
@@ -297,8 +299,12 @@ async def build_signed_tx(action, mint, amount, denominated_in_sol, slippage=Non
     signed = VersionedTransaction(unsigned.message, [TRADING_KEYPAIR])
     return base64.b64encode(bytes(signed)).decode()
 
+class SimFailed(Exception):
+    """فشل simulation ديال المعاملة (preflight). السبب الحقيقي كيبقى فالرسالة."""
+
 async def rpc_call(method, params):
     last_err = None
+    errors = []
     for rpc in PUBLIC_HTTP_RPCS:
         try:
             async with aiohttp.ClientSession() as session:
@@ -307,12 +313,20 @@ async def rpc_call(method, params):
                     data = await resp.json()
                     if "error" in data:
                         last_err = data["error"]
+                        errors.append(f"{urlparse(rpc).netloc}: {scrub(json.dumps(last_err))[:200]}")
+                        # المشكل فالمعاملة نفسها، ما فايدة نجرب RPC آخر (كيضيع الوقت ويخبي السبب)
+                        if (method == "sendTransaction" and isinstance(last_err, dict)
+                                and last_err.get("code") == -32002):
+                            raise SimFailed(scrub(json.dumps(last_err))[:700])
                         continue
                     return data.get("result")
+        except SimFailed:
+            raise
         except Exception as e:
             last_err = e
+            errors.append(f"{urlparse(rpc).netloc}: {scrub(e)[:200]}")
             continue
-    raise RuntimeError(f"All RPCs failed: {scrub(last_err)}")
+    raise RuntimeError("All RPCs failed -> " + " | ".join(errors))
 
 async def get_token_balance(mint):
     """رصيد التوكن فالمحفظة (None إلا ما قدرناش نقراوه)."""
@@ -330,7 +344,8 @@ async def get_token_balance(mint):
 
 async def send_and_confirm(tx_b64, skip_preflight=True, timeout=None):
     sig = await rpc_call("sendTransaction", [tx_b64, {
-        "encoding": "base64", "skipPreflight": skip_preflight, "maxRetries": 5
+        "encoding": "base64", "skipPreflight": skip_preflight, "maxRetries": 5,
+        "preflightCommitment": "processed"
     }])
     deadline = time.time() + (timeout if timeout is not None else CONFIRM_TIMEOUT_SECONDS)
     while time.time() < deadline:
@@ -415,18 +430,31 @@ async def execute_sell(mint, reason, current_mcap):
             sig, ok = "DRY_RUN", True
         else:
             for attempt in range(1, SELL_RETRIES + 1):
+                # بعد الـ migration العملة كتتباع فـ PumpSwap ماشي فالـ bonding curve.
+                # كنبداو بالـ pool المناسب وكنبدلو بين المحاولات إلا فشل.
+                preferred = "pump-amm" if pos.get("migrated") else "auto"
+                if pos.get("last_pool") == preferred:   # المحاولة اللي فاتت فشلات بيه: نبدلو
+                    pool = "auto" if preferred == "pump-amm" else "pump-amm"
+                else:
+                    pool = preferred
+                pos["last_pool"] = pool
                 try:
                     # كل محاولة = معاملة جديدة (blockhash جديد) بدل الانتظار الطويل
                     tx = await build_signed_tx("sell", mint, "100%", False,
                                                slippage=SELL_SLIPPAGE_PCT,
-                                               priority_fee=SELL_PRIORITY_FEE_SOL)
+                                               priority_fee=SELL_PRIORITY_FEE_SOL,
+                                               pool=pool)
                     # preflight شغال: إلا كانت المعاملة غادي تفشل ما كتتبعثش وما كتخلصش رسوم
                     sig, ok = await send_and_confirm(tx, skip_preflight=False,
                                                      timeout=SELL_CONFIRM_SECONDS)
                     if ok:
                         break
+                    pos["last_err"] = f"المعاملة ما تأكدتش أو فشلات على الشبكة: {sig}"
                 except Exception as e:
-                    print(f"⚠️ Sell attempt {attempt} failed: {scrub(e)}")
+                    pos["last_err"] = f"[pool={pool}] {scrub(e)}"[:700]
+                    if any(k in str(e).lower() for k in ("bondingcurvecomplete", "6005")):
+                        pos["migrated"] = True   # الـ bonding curve سالات: العملة فـ PumpSwap
+                    print(f"⚠️ Sell attempt {attempt} [{pool}] failed: {scrub(e)}")
                 # بعد كل فشل: واش الرصيد وصل 0؟ (المعاملة وصلات متأخرة أو بعتيها يدويا)
                 bal = await get_token_balance(mint)
                 if bal is not None and bal == 0:
@@ -459,15 +487,26 @@ async def execute_sell(mint, reason, current_mcap):
         )
         await send_telegram_with_button(msg, mint)
     else:
-        # فشل البيع: تبريد 20 ثانية بين المحاولات، وأقصى 3 محاولات إجمالا
+        # فشل البيع: كنعاود تلقائيا. "selling" كيبقى True باش TP/SL ما يتفعلوش جوج مرات،
+        # والبيع كيبقى مطلوب حتى إلا رجع السعر تحت الـ TP.
         pos["fails"] = pos.get("fails", 0) + 1
-        pos["next_try"] = time.time() + 20
-        pos["selling"] = False
-        if pos["fails"] >= 3:
+        err = html.escape(str(pos.get("last_err", "unknown")))[:600]
+        print(f"⚠️ Sell round {pos['fails']}/{MAX_SELL_ROUNDS} failed for {mint}: {err}")
+        if pos["fails"] >= MAX_SELL_ROUNDS:
             positions.pop(mint, None)
-            print(f"⛔ Gave up selling {mint} after {pos['fails']} failed rounds")
-        await send_telegram_with_button(
-            f"⚠️ <b>AUTO SELL FAILED ({reason})</b>\n<code>{mint}</code>\n(المحاولة {pos.get('fails', 0)}/3). إلا وصلات 3 كنوقف المراقبة، بيع يدويا.", mint)
+            await send_telegram_with_button(
+                f"⛔ <b>AUTO SELL GAVE UP ({reason})</b>\n<code>{mint}</code>\n"
+                f"فشلات {MAX_SELL_ROUNDS} جولات. بيع يدويا دابا.\n"
+                f"<b>آخر خطأ:</b>\n<code>{err}</code>", mint)
+            return
+        if pos["fails"] == 1:   # تنبيه واحد فقط باش ما تتعباش بالرسائل
+            await send_telegram_with_button(
+                f"⚠️ <b>AUTO SELL FAILED ({reason})</b>\n<code>{mint}</code>\n"
+                f"كنعاود المحاولة تلقائيا (حتى {MAX_SELL_ROUNDS} جولات).\n"
+                f"<b>الخطأ:</b>\n<code>{err}</code>", mint)
+        await asyncio.sleep(SELL_ROUND_COOLDOWN_SECONDS)
+        if mint in positions:
+            await execute_sell(mint, reason, current_mcap)
 
 def check_position(mint, current_mcap):
     pos = positions.get(mint)
