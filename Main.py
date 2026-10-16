@@ -141,7 +141,7 @@ MAX_PROCESSED_SIGNATURES = 100_000
 AUTO_TRADE_ENABLED = True       # False = تنبيهات فقط بلا شراء
 DRY_RUN = False                 # True = كيحاكي الشراء/البيع بلا ما يرسل معاملات حقيقية
 BUY_AMOUNT_SOL = 0.007          # مبلغ الصفقة
-TAKE_PROFIT_PCT = 70.0          # +70%
+TAKE_PROFIT_PCT = 110.0          # +110%
 STOP_LOSS_PCT = 50.0            # -50%
 SLIPPAGE_PCT = 20               # slippage مسموح (%)
 PRIORITY_FEE_SOL = 0.0005       # رسوم الأولوية
